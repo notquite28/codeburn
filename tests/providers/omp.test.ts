@@ -154,6 +154,38 @@ describe('omp provider - session discovery', () => {
     const sessions = await provider.discoverSessions()
     expect(sessions).toEqual([])
   })
+
+  it('discovers sessions from named OMP profiles alongside the default dir', async () => {
+    // Real multi-profile OMP keeps the default under <home>/agent/sessions and
+    // each profile under <home>/profiles/<name>/agent/sessions. Production
+    // createOmpProvider() with no override scans both; inject HOME so the
+    // provider resolves those paths under the temp fixture.
+    const ompHome = join(tmpDir, '.omp')
+    const defaultProject = join(ompHome, 'agent', 'sessions', '--Users-test-default--')
+    const profileProject = join(ompHome, 'profiles', 'grok-build', 'agent', 'sessions', '--Users-test-profile--')
+    await writeSession(defaultProject, 'default.jsonl', [
+      sessionMeta({ id: 'sess-default', cwd: '/Users/test/default-proj' }),
+      assistantMessage({ id: 'a1' }),
+    ])
+    await writeSession(profileProject, 'profile.jsonl', [
+      titleEntry(),
+      sessionMeta({ id: 'sess-profile', cwd: '/Users/test/profile-proj' }),
+      assistantMessage({ id: 'a2' }),
+    ])
+
+    const prevHome = process.env.HOME
+    process.env.HOME = tmpDir
+    try {
+      const provider = createOmpProvider()
+      const sessions = await provider.discoverSessions()
+      const projects = sessions.map(s => s.project).sort()
+      expect(projects).toEqual(['default-proj', 'profile-proj'])
+      expect(sessions.every(s => s.provider === 'omp')).toBe(true)
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME
+      else process.env.HOME = prevHome
+    }
+  })
 })
 
 describe('omp provider - JSONL parsing', () => {

@@ -86,8 +86,28 @@ function getPiSessionsDir(override?: string): string {
   return override ?? join(homedir(), '.pi', 'agent', 'sessions')
 }
 
-function getOmpSessionsDir(override?: string): string {
-  return override ?? join(homedir(), '.omp', 'agent', 'sessions')
+// OMP keeps the legacy/default profile under ~/.omp/agent/sessions and every
+// named profile under ~/.omp/profiles/<name>/agent/sessions. Scan both so
+// codeburn totals match real multi-profile usage. An explicit sessionsDir
+// override (tests) still means "only this directory".
+async function listOmpSessionDirs(sessionsDirOverride?: string): Promise<string[]> {
+  if (sessionsDirOverride) return [sessionsDirOverride]
+
+  const ompHome = join(homedir(), '.omp')
+  const dirs: string[] = [join(ompHome, 'agent', 'sessions')]
+  const profilesDir = join(ompHome, 'profiles')
+  let profiles: string[]
+  try {
+    profiles = await readdir(profilesDir)
+  } catch {
+    return dirs
+  }
+  for (const name of profiles) {
+    const sessionsDir = join(profilesDir, name, 'agent', 'sessions')
+    const s = await stat(sessionsDir).catch(() => null)
+    if (s?.isDirectory()) dirs.push(sessionsDir)
+  }
+  return dirs
 }
 
 // Find the `session` header entry. Historically it sat on line 0, but real OMP
@@ -305,8 +325,6 @@ export function createPiProvider(sessionsDir?: string): Provider {
 export const pi = createPiProvider()
 
 export function createOmpProvider(sessionsDir?: string): Provider {
-  const dir = getOmpSessionsDir(sessionsDir)
-
   return {
     name: 'omp',
     displayName: 'OMP',
@@ -323,7 +341,12 @@ export function createOmpProvider(sessionsDir?: string): Provider {
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
-      return discoverSessionsInDir(dir, 'omp')
+      const dirs = await listOmpSessionDirs(sessionsDir)
+      const sources: SessionSource[] = []
+      for (const dir of dirs) {
+        sources.push(...await discoverSessionsInDir(dir, 'omp'))
+      }
+      return sources
     },
 
     createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {

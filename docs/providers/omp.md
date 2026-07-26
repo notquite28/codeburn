@@ -4,11 +4,14 @@ OMP CLI. Same parser as Pi, different data directory.
 
 - **Source:** `src/providers/pi.ts` (the `omp` export)
 - **Loading:** eager (`src/providers/index.ts:9`)
-- **Test:** `tests/providers/omp.test.ts` (225 lines)
+- **Test:** `tests/providers/omp.test.ts` (253 lines)
 
 ## Where it reads from
 
-`~/.omp/agent/sessions/` (`pi.ts:59-61`).
+- Default / legacy: `~/.omp/agent/sessions/`
+- Named profiles: `~/.omp/profiles/<profile>/agent/sessions/`
+
+Discovery unions both roots (`listOmpSessionDirs`, `pi.ts`). An explicit sessions-dir override (tests) still scans only that directory.
 
 ## Storage format
 
@@ -20,12 +23,13 @@ None.
 
 ## Deduplication
 
-Identical to Pi: `<provider>:<path>:<responseId>` with timestamp / line-index fallbacks (`pi.ts:164`).
+Identical to Pi: `<provider>:<path>:<responseId>` with timestamp / line-index fallbacks (`pi.ts:210`).
 
 ## Quirks
 
-- OMP and Pi share the **same** `createParser` function. The provider object differs only in name, displayName, and the discovery directory.
+- OMP and Pi share the **same** `createParser` function. The provider object differs only in name, displayName, and discovery roots (OMP also walks named profiles under `~/.omp/profiles/`).
 - If OMP and Pi diverge in a future release, do **not** copy-paste the parser. Add a discriminator to `createParser` and branch.
+- Real OMP files lead with a `{type:"title"}` entry and place the `{type:"session"}` header one or more lines down (32 of 34 files on a real machine). Discovery scans a bounded line prefix for the `session` entry rather than requiring it on line 0 (`readSessionEntry`, `pi.ts:101`). Pi shares this path, so the same guard covers both.
 
 ## When fixing a bug here
 

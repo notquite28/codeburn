@@ -2,7 +2,7 @@ import { readdir, stat } from 'fs/promises'
 import { basename, join } from 'path'
 import { homedir } from 'os'
 
-import { readSessionFile } from '../fs-utils.js'
+import { readSessionLines } from '../fs-utils.js'
 import { calculateCost } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import { normalizeContentBlocks } from '../content-utils.js'
@@ -86,20 +86,57 @@ function getPiSessionsDir(override?: string): string {
   return override ?? join(homedir(), '.pi', 'agent', 'sessions')
 }
 
-function getOmpSessionsDir(override?: string): string {
-  return override ?? join(homedir(), '.omp', 'agent', 'sessions')
+// OMP keeps the legacy/default profile under ~/.omp/agent/sessions and every
+// named profile under ~/.omp/profiles/<name>/agent/sessions. Scan both so
+// codeburn totals match real multi-profile usage. An explicit sessionsDir
+// override (tests) still means "only this directory".
+async function listOmpSessionDirs(sessionsDirOverride?: string): Promise<string[]> {
+  if (sessionsDirOverride) return [sessionsDirOverride]
+
+  const ompHome = join(homedir(), '.omp')
+  const dirs: string[] = [join(ompHome, 'agent', 'sessions')]
+  const profilesDir = join(ompHome, 'profiles')
+  let profiles: string[]
+  try {
+    profiles = await readdir(profilesDir)
+  } catch {
+    return dirs
+  }
+  for (const name of profiles) {
+    const sessionsDir = join(profilesDir, name, 'agent', 'sessions')
+    const s = await stat(sessionsDir).catch(() => null)
+    if (s?.isDirectory()) dirs.push(sessionsDir)
+  }
+  return dirs
 }
 
-async function readFirstEntry(filePath: string): Promise<PiEntry | null> {
-  const content = await readSessionFile(filePath)
-  if (content === null) return null
-  const line = content.split('\n')[0]
-  if (!line?.trim()) return null
-  try {
-    return JSON.parse(line) as PiEntry
-  } catch {
-    return null
+// Find the `session` header entry. Historically it sat on line 0, but real OMP
+// files (and recent Pi builds) lead with a `title` entry and place `session`
+// one or more lines down - 32 of 34 files on a real machine are title-first,
+// so a strict line-0 check discovers almost nothing (issue: OMP reads 0/34).
+// Scan a bounded prefix so both shapes resolve; files with no `session` entry
+// in the prefix stay skipped, preserving the old "must start with a session"
+// guard's intent without the off-by-one. The parser loop below already locates
+// `session` anywhere, so only discovery needed fixing. Pi and OMP share this.
+const MAX_HEADER_LINES = 32
+async function readSessionEntry(filePath: string): Promise<PiEntry | null> {
+  // Stream the header instead of loading the whole file. Real Pi/OMP sessions
+  // can be hundreds of MB (image-heavy turns); readSessionFile's 128 MB cap
+  // silently drops them at discovery. readSessionLines has a 4 GB cap and
+  // bounded memory, and we only ever need the first few lines here.
+  let scanned = 0
+  for await (const line of readSessionLines(filePath)) {
+    if (scanned++ >= MAX_HEADER_LINES) break
+    if (!line.trim()) continue
+    let entry: PiEntry
+    try {
+      entry = JSON.parse(line) as PiEntry
+    } catch {
+      continue
+    }
+    if (entry.type === 'session') return entry
   }
+  return null
 }
 
 async function discoverSessionsInDir(sessionsDir: string, providerName: string): Promise<SessionSource[]> {
@@ -130,10 +167,10 @@ async function discoverSessionsInDir(sessionsDir: string, providerName: string):
       const fileStat = await stat(filePath).catch(() => null)
       if (!fileStat?.isFile()) continue
 
-      const first = await readFirstEntry(filePath)
-      if (!first || first.type !== 'session') continue
+      const session = await readSessionEntry(filePath)
+      if (!session) continue
 
-      const cwd = first.cwd ?? dirName
+      const cwd = session.cwd ?? dirName
       sources.push({ path: filePath, project: basename(cwd), provider: providerName })
     }
   }
@@ -144,13 +181,17 @@ async function discoverSessionsInDir(sessionsDir: string, providerName: string):
 function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
   return {
     async *parse(): AsyncGenerator<ParsedProviderCall> {
-      const content = await readSessionFile(source.path)
-      if (content === null) return
-      const lines = content.split('\n').filter(l => l.trim())
+      // Stream line-by-line. Pi/OMP session files can be hundreds of MB, which
+      // exceeds readSessionFile's 128 MB cap and would drop the whole session.
+      // readSessionLines handles multi-GB files with bounded memory (same
+      // approach as codex / kimi / lingtai-tui / mux / open-design / mistral-vibe).
       let sessionId = basename(source.path, '.jsonl')
       let pendingUserMessage = ''
+      let lineIdx = 0
 
-      for (const [lineIdx, line] of lines.entries()) {
+      for await (const line of readSessionLines(source.path)) {
+        if (!line.trim()) continue
+        lineIdx++
         let entry: PiEntry
         try {
           entry = JSON.parse(line) as PiEntry
@@ -284,8 +325,6 @@ export function createPiProvider(sessionsDir?: string): Provider {
 export const pi = createPiProvider()
 
 export function createOmpProvider(sessionsDir?: string): Provider {
-  const dir = getOmpSessionsDir(sessionsDir)
-
   return {
     name: 'omp',
     displayName: 'OMP',
@@ -302,7 +341,12 @@ export function createOmpProvider(sessionsDir?: string): Provider {
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
-      return discoverSessionsInDir(dir, 'omp')
+      const dirs = await listOmpSessionDirs(sessionsDir)
+      const sources: SessionSource[] = []
+      for (const dir of dirs) {
+        sources.push(...await discoverSessionsInDir(dir, 'omp'))
+      }
+      return sources
     },
 
     createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {

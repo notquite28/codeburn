@@ -25,6 +25,17 @@ function sessionMeta(opts: { id?: string; cwd?: string } = {}) {
     cwd: opts.cwd ?? '/Users/test/myproject',
   })
 }
+// Real OMP files lead with a {type:'title'} entry; the {type:'session'} header
+// lands on a later line (32 of 34 files on a real machine are title-first).
+function titleEntry() {
+  return JSON.stringify({
+    type: 'title',
+    v: 1,
+    title: 'a session title',
+    source: 'auto',
+    updatedAt: '2026-06-28T16:15:14.000Z',
+  })
+}
 
 function userMessage(text: string) {
   return JSON.stringify({
@@ -109,6 +120,23 @@ describe('omp provider - session discovery', () => {
     expect(sessions[0]!.provider).toBe('omp')
     expect(sessions[0]!.project).toBe('myproject')
   })
+  it('discovers a session when a title entry precedes the session header', async () => {
+    // Real OMP writes title on line 0 and the session header further down.
+    // Discovery must scan past the title instead of requiring session on line 0.
+    const projectDir = join(tmpDir, '--Users-test-myproject--')
+    await writeSession(projectDir, '2026-06-28T_title-first.jsonl', [
+      titleEntry(),
+      sessionMeta({ id: 'sess-title', cwd: '/Users/test/myproject' }),
+      assistantMessage({}),
+    ])
+
+    const provider = createOmpProvider(tmpDir)
+    const sessions = await provider.discoverSessions()
+
+    expect(sessions).toHaveLength(1)
+    expect(sessions[0]!.provider).toBe('omp')
+    expect(sessions[0]!.project).toBe('myproject')
+  })
 
   it('returns empty for non-existent directory', async () => {
     const provider = createOmpProvider('/nonexistent/omp/path')
@@ -116,7 +144,7 @@ describe('omp provider - session discovery', () => {
     expect(sessions).toEqual([])
   })
 
-  it('skips files whose first line is not a session entry', async () => {
+  it('skips files with no session entry', async () => {
     const projectDir = join(tmpDir, '--Users-test-myproject--')
     await writeSession(projectDir, 'bad.jsonl', [
       JSON.stringify({ type: 'message', id: 'x' }),
@@ -125,6 +153,38 @@ describe('omp provider - session discovery', () => {
     const provider = createOmpProvider(tmpDir)
     const sessions = await provider.discoverSessions()
     expect(sessions).toEqual([])
+  })
+
+  it('discovers sessions from named OMP profiles alongside the default dir', async () => {
+    // Real multi-profile OMP keeps the default under <home>/agent/sessions and
+    // each profile under <home>/profiles/<name>/agent/sessions. Production
+    // createOmpProvider() with no override scans both; inject HOME so the
+    // provider resolves those paths under the temp fixture.
+    const ompHome = join(tmpDir, '.omp')
+    const defaultProject = join(ompHome, 'agent', 'sessions', '--Users-test-default--')
+    const profileProject = join(ompHome, 'profiles', 'grok-build', 'agent', 'sessions', '--Users-test-profile--')
+    await writeSession(defaultProject, 'default.jsonl', [
+      sessionMeta({ id: 'sess-default', cwd: '/Users/test/default-proj' }),
+      assistantMessage({ id: 'a1' }),
+    ])
+    await writeSession(profileProject, 'profile.jsonl', [
+      titleEntry(),
+      sessionMeta({ id: 'sess-profile', cwd: '/Users/test/profile-proj' }),
+      assistantMessage({ id: 'a2' }),
+    ])
+
+    const prevHome = process.env.HOME
+    process.env.HOME = tmpDir
+    try {
+      const provider = createOmpProvider()
+      const sessions = await provider.discoverSessions()
+      const projects = sessions.map(s => s.project).sort()
+      expect(projects).toEqual(['default-proj', 'profile-proj'])
+      expect(sessions.every(s => s.provider === 'omp')).toBe(true)
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME
+      else process.env.HOME = prevHome
+    }
   })
 })
 

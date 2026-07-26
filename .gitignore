@@ -30,6 +30,8 @@ npm-debug.log*
 
 # Cache
 .cache/
+# Nix / direnv (flake devShell cache; flake.nix + .envrc ARE tracked)
+.direnv/
 *.sqlite
 
 # Build artifacts

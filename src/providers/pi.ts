@@ -90,16 +90,32 @@ function getOmpSessionsDir(override?: string): string {
   return override ?? join(homedir(), '.omp', 'agent', 'sessions')
 }
 
-async function readFirstEntry(filePath: string): Promise<PiEntry | null> {
+// Find the `session` header entry. Historically it sat on line 0, but real OMP
+// files (and recent Pi builds) lead with a `title` entry and place `session`
+// one or more lines down - 32 of 34 files on a real machine are title-first,
+// so a strict line-0 check discovers almost nothing (issue: OMP reads 0/34).
+// Scan a bounded prefix so both shapes resolve; files with no `session` entry
+// in the prefix stay skipped, preserving the old "must start with a session"
+// guard's intent without the off-by-one. The parser loop below already locates
+// `session` anywhere, so only discovery needed fixing. Pi and OMP share this.
+const MAX_HEADER_LINES = 32
+async function readSessionEntry(filePath: string): Promise<PiEntry | null> {
   const content = await readSessionFile(filePath)
   if (content === null) return null
-  const line = content.split('\n')[0]
-  if (!line?.trim()) return null
-  try {
-    return JSON.parse(line) as PiEntry
-  } catch {
-    return null
+  const lines = content.split('\n')
+  const end = Math.min(lines.length, MAX_HEADER_LINES)
+  for (let i = 0; i < end; i++) {
+    const line = lines[i]
+    if (!line?.trim()) continue
+    let entry: PiEntry
+    try {
+      entry = JSON.parse(line) as PiEntry
+    } catch {
+      continue
+    }
+    if (entry.type === 'session') return entry
   }
+  return null
 }
 
 async function discoverSessionsInDir(sessionsDir: string, providerName: string): Promise<SessionSource[]> {
@@ -130,10 +146,10 @@ async function discoverSessionsInDir(sessionsDir: string, providerName: string):
       const fileStat = await stat(filePath).catch(() => null)
       if (!fileStat?.isFile()) continue
 
-      const first = await readFirstEntry(filePath)
-      if (!first || first.type !== 'session') continue
+      const session = await readSessionEntry(filePath)
+      if (!session) continue
 
-      const cwd = first.cwd ?? dirName
+      const cwd = session.cwd ?? dirName
       sources.push({ path: filePath, project: basename(cwd), provider: providerName })
     }
   }

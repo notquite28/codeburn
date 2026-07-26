@@ -25,6 +25,17 @@ function sessionMeta(opts: { id?: string; cwd?: string } = {}) {
     cwd: opts.cwd ?? '/Users/test/myproject',
   })
 }
+// Real OMP files lead with a {type:'title'} entry; the {type:'session'} header
+// lands on a later line (32 of 34 files on a real machine are title-first).
+function titleEntry() {
+  return JSON.stringify({
+    type: 'title',
+    v: 1,
+    title: 'a session title',
+    source: 'auto',
+    updatedAt: '2026-06-28T16:15:14.000Z',
+  })
+}
 
 function userMessage(text: string) {
   return JSON.stringify({
@@ -109,6 +120,23 @@ describe('omp provider - session discovery', () => {
     expect(sessions[0]!.provider).toBe('omp')
     expect(sessions[0]!.project).toBe('myproject')
   })
+  it('discovers a session when a title entry precedes the session header', async () => {
+    // Real OMP writes title on line 0 and the session header further down.
+    // Discovery must scan past the title instead of requiring session on line 0.
+    const projectDir = join(tmpDir, '--Users-test-myproject--')
+    await writeSession(projectDir, '2026-06-28T_title-first.jsonl', [
+      titleEntry(),
+      sessionMeta({ id: 'sess-title', cwd: '/Users/test/myproject' }),
+      assistantMessage({}),
+    ])
+
+    const provider = createOmpProvider(tmpDir)
+    const sessions = await provider.discoverSessions()
+
+    expect(sessions).toHaveLength(1)
+    expect(sessions[0]!.provider).toBe('omp')
+    expect(sessions[0]!.project).toBe('myproject')
+  })
 
   it('returns empty for non-existent directory', async () => {
     const provider = createOmpProvider('/nonexistent/omp/path')
@@ -116,7 +144,7 @@ describe('omp provider - session discovery', () => {
     expect(sessions).toEqual([])
   })
 
-  it('skips files whose first line is not a session entry', async () => {
+  it('skips files with no session entry', async () => {
     const projectDir = join(tmpDir, '--Users-test-myproject--')
     await writeSession(projectDir, 'bad.jsonl', [
       JSON.stringify({ type: 'message', id: 'x' }),

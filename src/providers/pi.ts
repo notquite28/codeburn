@@ -86,29 +86,6 @@ function getPiSessionsDir(override?: string): string {
   return override ?? join(homedir(), '.pi', 'agent', 'sessions')
 }
 
-// OMP keeps the legacy/default profile under ~/.omp/agent/sessions and every
-// named profile under ~/.omp/profiles/<name>/agent/sessions. Scan both so
-// codeburn totals match real multi-profile usage. An explicit sessionsDir
-// override (tests) still means "only this directory".
-async function listOmpSessionDirs(sessionsDirOverride?: string): Promise<string[]> {
-  if (sessionsDirOverride) return [sessionsDirOverride]
-
-  const ompHome = join(homedir(), '.omp')
-  const dirs: string[] = [join(ompHome, 'agent', 'sessions')]
-  const profilesDir = join(ompHome, 'profiles')
-  let profiles: string[]
-  try {
-    profiles = await readdir(profilesDir)
-  } catch {
-    return dirs
-  }
-  for (const name of profiles) {
-    const sessionsDir = join(profilesDir, name, 'agent', 'sessions')
-    const s = await stat(sessionsDir).catch(() => null)
-    if (s?.isDirectory()) dirs.push(sessionsDir)
-  }
-  return dirs
-}
 
 // Find the `session` header entry. Historically it sat on line 0, but real OMP
 // files (and recent Pi builds) lead with a `title` entry and place `session`
@@ -324,35 +301,3 @@ export function createPiProvider(sessionsDir?: string): Provider {
 
 export const pi = createPiProvider()
 
-export function createOmpProvider(sessionsDir?: string): Provider {
-  return {
-    name: 'omp',
-    displayName: 'OMP',
-
-    modelDisplayName(model: string): string {
-      for (const [key, name] of modelDisplayEntries) {
-        if (model.startsWith(key)) return name
-      }
-      return model
-    },
-
-    toolDisplayName(rawTool: string): string {
-      return toolNameMap[rawTool] ?? rawTool
-    },
-
-    async discoverSessions(): Promise<SessionSource[]> {
-      const dirs = await listOmpSessionDirs(sessionsDir)
-      const sources: SessionSource[] = []
-      for (const dir of dirs) {
-        sources.push(...await discoverSessionsInDir(dir, 'omp'))
-      }
-      return sources
-    },
-
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-      return createParser(source, seenKeys)
-    },
-  }
-}
-
-export const omp = createOmpProvider()

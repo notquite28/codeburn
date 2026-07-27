@@ -1,38 +1,70 @@
 # OMP
 
-OMP CLI. Same parser as Pi, different data directory.
+OMP (Oh My Pi). Reads OMP's own usage database, not the session transcripts.
 
-- **Source:** `src/providers/pi.ts` (the `omp` export)
-- **Loading:** eager (`src/providers/index.ts:9`)
-- **Test:** `tests/providers/omp.test.ts` (253 lines)
+- **Source:** `src/providers/omp.ts`
+- **Loading:** eager (`src/providers/index.ts`)
+- **Test:** `tests/providers/omp.test.ts`
 
 ## Where it reads from
 
-- Default / legacy: `~/.omp/agent/sessions/`
-- Named profiles: `~/.omp/profiles/<profile>/agent/sessions/`
+- `~/.omp/stats.db` (the global DB)
+- `~/.omp/profiles/<profile>/stats.db` (one per named profile, if present)
 
-Discovery unions both roots (`listOmpSessionDirs`, `pi.ts`). An explicit sessions-dir override (tests) still scans only that directory.
+OMP writes one row per API call into `stats.db` — main turns **and** subagent
+dispatches, including streaming continuations — with per-call token counts and
+its own pre-computed `cost_total` at the rates it actually pays. This is the
+authoritative source; the JSONL transcripts under `~/.omp/agent/sessions/` are
+an incomplete subset (subagent transcripts nest several levels deep, and a
+single assistant message can fold several API calls), so we read the DB
+directly and ignore the transcripts for cost/usage.
 
 ## Storage format
 
-JSONL, identical schema to Pi.
+SQLite. Tables used:
+
+- `messages` — one row per call: `model`, `folder`, `timestamp` (epoch ms),
+  `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`,
+  `cost_total`. `UNIQUE(session_file, entry_id)`.
+- `tool_calls` — tool invocations, joined to `messages` on
+  `(session_file, entry_id)` for the tools/activity breakdown.
+
+## Pricing
+
+OMP's `cost_total` is preserved verbatim (see the provider-cost allowlist in
+`src/parser.ts`). codeburn does **not** recompute via LiteLLM — OMP's real rates
+differ from LiteLLM/fallback for several models (e.g. `gpt-5.6-sol` is ~3.3x
+cheaper than the fallback), and the DB already carries the exact figure. Rows
+with `cost_total = 0` are reported as $0 (OMP priced them $0 — typically cached
+or bundled subagent turns); their tokens still count.
 
 ## Caching
 
-None.
+Standard session cache, keyed by DB path; invalidated by `stats.db` mtime.
 
 ## Deduplication
 
-Identical to Pi: `<provider>:<path>:<responseId>` with timestamp / line-index fallbacks (`pi.ts:210`).
+`omp:<session_file>:<entry_id>` — stable and globally unique because the
+schema enforces `UNIQUE(session_file, entry_id)`.
 
 ## Quirks
 
-- OMP and Pi share the **same** `createParser` function. The provider object differs only in name, displayName, and discovery roots (OMP also walks named profiles under `~/.omp/profiles/`).
-- If OMP and Pi diverge in a future release, do **not** copy-paste the parser. Add a discriminator to `createParser` and branch.
-- Real OMP files lead with a `{type:"title"}` entry and place the `{type:"session"}` header one or more lines down (32 of 34 files on a real machine). Discovery scans a bounded line prefix for the `session` entry rather than requiring it on line 0 (`readSessionEntry`, `pi.ts:101`). Pi shares this path, so the same guard covers both.
+- **No bash commands or user message.** `tool_calls` stores tool names but not
+  command args, so `bashCommands` is empty. `userMessage` is empty, so turn
+  category classification falls back to tool-based signals (still works, just
+  without user-keyword hints).
+- **Project from `folder`.** OMP sanitizes cwd with `-` for `/`; the provider
+  reverses that to derive the project label (`-Code-Projects-X` -> `X`).
+- **All-zero rows skipped.** Rows where every token field is 0 (error/aborted
+  calls) are dropped so they don't inflate the call count.
+- Pi remains a separate JSONL provider (`src/providers/pi.ts`); OMP no longer
+  shares its parser.
 
 ## When fixing a bug here
 
-1. Check if the bug also reproduces against Pi. If yes, fix both with one change; the parser is shared.
-2. If the bug is OMP-specific, the right fix is usually to pass an option into `createParser` rather than to fork the file.
-3. Read [`pi.md`](pi.md) for the parser-level details.
+1. Compare codeburn's per-model totals against `stats.db` directly:
+   `SELECT model, count(*), sum(cost_total), sum(input_tokens) FROM messages GROUP BY model`.
+   If they match, the bug is downstream of the provider; if not, it's here.
+2. A schema change in a future OMP build shows up as `discoverSessions`
+   returning empty (validateSchema fails) — `codeburn doctor --provider omp`
+   reports the probed DB path.

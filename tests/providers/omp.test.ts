@@ -1,285 +1,277 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises'
+import { mkdtemp, rm } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
+import { createRequire } from 'node:module'
 
-import { createOmpProvider } from '../../src/providers/pi.js'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { isSqliteAvailable } from '../../src/sqlite.js'
+import { createOmpProvider } from '../../src/providers/omp.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
-let tmpDir: string
+const requireForTest = createRequire(import.meta.url)
+
+type TestDb = {
+  exec(sql: string): void
+  prepare(sql: string): { run(...params: unknown[]): void }
+  close(): void
+}
+
+let tmpRoot: string
 
 beforeEach(async () => {
-  tmpDir = await mkdtemp(join(tmpdir(), 'omp-test-'))
+  tmpRoot = await mkdtemp(join(tmpdir(), 'omp-stats-test-'))
 })
 
 afterEach(async () => {
-  await rm(tmpDir, { recursive: true, force: true })
+  await rm(tmpRoot, { recursive: true, force: true })
 })
 
-function sessionMeta(opts: { id?: string; cwd?: string } = {}) {
-  return JSON.stringify({
-    type: 'session',
-    version: 3,
-    id: opts.id ?? 'sess-001',
-    timestamp: '2026-04-14T10:00:00.000Z',
-    cwd: opts.cwd ?? '/Users/test/myproject',
-  })
-}
-// Real OMP files lead with a {type:'title'} entry; the {type:'session'} header
-// lands on a later line (32 of 34 files on a real machine are title-first).
-function titleEntry() {
-  return JSON.stringify({
-    type: 'title',
-    v: 1,
-    title: 'a session title',
-    source: 'auto',
-    updatedAt: '2026-06-28T16:15:14.000Z',
-  })
+// Build a stats.db with the columns omp.ts queries. Mirrors OMP's real schema
+// (UNIQUE(session_file, entry_id) so the dedup key is stable).
+function createStatsDb(): string {
+  const dbPath = join(tmpRoot, 'stats.db')
+  const { DatabaseSync: Database } = requireForTest('node:sqlite')
+  const db = new Database(dbPath) as TestDb
+  db.exec(`
+    CREATE TABLE messages(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_file TEXT NOT NULL,
+      entry_id TEXT NOT NULL,
+      folder TEXT NOT NULL,
+      model TEXT NOT NULL,
+      provider TEXT NOT NULL DEFAULT 'omp',
+      api TEXT NOT NULL DEFAULT 'omp',
+      timestamp INTEGER NOT NULL,
+      duration INTEGER, ttft INTEGER,
+      stop_reason TEXT NOT NULL DEFAULT 'stop',
+      error_message TEXT,
+      input_tokens INTEGER NOT NULL,
+      output_tokens INTEGER NOT NULL,
+      cache_read_tokens INTEGER NOT NULL,
+      cache_write_tokens INTEGER NOT NULL,
+      total_tokens INTEGER NOT NULL,
+      premium_requests REAL NOT NULL DEFAULT 0,
+      cost_input REAL NOT NULL DEFAULT 0,
+      cost_output REAL NOT NULL DEFAULT 0,
+      cost_cache_read REAL NOT NULL DEFAULT 0,
+      cost_cache_write REAL NOT NULL DEFAULT 0,
+      cost_total REAL NOT NULL,
+      agent_type TEXT NOT NULL DEFAULT 'main',
+      UNIQUE(session_file, entry_id)
+    );
+    CREATE TABLE tool_calls(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_file TEXT NOT NULL,
+      entry_id TEXT NOT NULL,
+      tool_call_id TEXT NOT NULL,
+      folder TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      model TEXT NOT NULL DEFAULT 'omp',
+      provider TEXT NOT NULL DEFAULT 'omp',
+      timestamp INTEGER NOT NULL DEFAULT 0,
+      agent_type TEXT NOT NULL DEFAULT 'main',
+      calls_in_turn INTEGER NOT NULL DEFAULT 1,
+      args_chars INTEGER NOT NULL DEFAULT 0,
+      result_chars INTEGER,
+      is_error INTEGER
+    );
+  `)
+  db.close()
+  return dbPath
 }
 
-function userMessage(text: string) {
-  return JSON.stringify({
-    type: 'message',
-    id: 'msg-user-1',
-    timestamp: '2026-04-14T10:00:10.000Z',
-    message: {
-      role: 'user',
-      content: [{ type: 'text', text }],
-      timestamp: 1776023210000,
-    },
-  })
+function withDb(dbPath: string, fn: (db: TestDb) => void): void {
+  const { DatabaseSync: Database } = requireForTest('node:sqlite')
+  const db = new Database(dbPath) as TestDb
+  try {
+    fn(db)
+  } finally {
+    db.close()
+  }
 }
 
-function assistantMessage(opts: {
-  id?: string
-  responseId?: string
-  timestamp?: string
+function insertMessage(db: TestDb, o: {
+  session_file?: string
+  entry_id: string
+  folder?: string
   model?: string
-  input?: number
-  output?: number
-  cacheRead?: number
-  cacheWrite?: number
-  tools?: Array<{ name: string; command?: string }>
-}) {
-  const content = (opts.tools ?? []).map(t => ({
-    type: 'toolCall',
-    id: `call-${t.name}`,
-    name: t.name,
-    arguments: t.command !== undefined ? { command: t.command } : {},
-  }))
-
-  return JSON.stringify({
-    type: 'message',
-    id: opts.id ?? 'msg-asst-1',
-    timestamp: opts.timestamp ?? '2026-04-14T10:00:30.000Z',
-    message: {
-      role: 'assistant',
-      content,
-      provider: 'anthropic',
-      model: opts.model ?? 'claude-sonnet-4-5',
-      responseId: opts.responseId ?? 'resp-001',
-      usage: {
-        input: opts.input ?? 1000,
-        output: opts.output ?? 200,
-        cacheRead: opts.cacheRead ?? 0,
-        cacheWrite: opts.cacheWrite ?? 0,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-      },
-      timestamp: 1776023230000,
-    },
-  })
+  timestamp?: number
+  input_tokens?: number
+  output_tokens?: number
+  cache_read_tokens?: number
+  cache_write_tokens?: number
+  cost_total?: number
+}): void {
+  const ins = db.prepare(`INSERT INTO messages
+    (session_file, entry_id, folder, model, timestamp,
+     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+     total_tokens, cost_total)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+  ins.run(
+    o.session_file ?? '/tmp/sess/main.jsonl',
+    o.entry_id,
+    o.folder ?? '-Code-Projects-Sample',
+    o.model ?? 'gpt-5.6-sol',
+    o.timestamp ?? 1785005105018,
+    o.input_tokens ?? 1000,
+    o.output_tokens ?? 200,
+    o.cache_read_tokens ?? 0,
+    o.cache_write_tokens ?? 0,
+    (o.input_tokens ?? 1000) + (o.output_tokens ?? 200),
+    o.cost_total ?? 0,
+  )
 }
 
-async function writeSession(projectDir: string, filename: string, lines: string[]) {
-  await mkdir(projectDir, { recursive: true })
-  const filePath = join(projectDir, filename)
-  await writeFile(filePath, lines.join('\n') + '\n')
-  return filePath
+function insertToolCall(db: TestDb, o: { entry_id: string; tool_name: string; session_file?: string }): void {
+  const ins = db.prepare(`INSERT INTO tool_calls
+    (session_file, entry_id, tool_call_id, folder, tool_name)
+    VALUES (?,?,?,?,?)`)
+  ins.run(o.session_file ?? '/tmp/sess/main.jsonl', o.entry_id, `tc-${o.tool_name}`, '-Code-Projects-Sample', o.tool_name)
 }
 
-describe('omp provider - identity', () => {
+describe.skipIf(!isSqliteAvailable())('omp provider (stats.db) - identity', () => {
   it('has correct name and displayName', () => {
-    const provider = createOmpProvider(tmpDir)
+    const provider = createOmpProvider(join(tmpRoot, 'stats.db'))
     expect(provider.name).toBe('omp')
     expect(provider.displayName).toBe('OMP')
   })
 })
 
-describe('omp provider - session discovery', () => {
-  it('discovers sessions from the omp sessions directory', async () => {
-    const projectDir = join(tmpDir, '--Users-test-myproject--')
-    await writeSession(projectDir, '2026-04-14T10-00-00-000Z_sess-001.jsonl', [
-      sessionMeta({ cwd: '/Users/test/myproject' }),
-      assistantMessage({}),
-    ])
+describe.skipIf(!isSqliteAvailable())('omp provider (stats.db) - discovery', () => {
+  it('discovers the stats.db source when it has rows', async () => {
+    const dbPath = createStatsDb()
+    withDb(dbPath, db => insertMessage(db, { entry_id: 'm1' }))
 
-    const provider = createOmpProvider(tmpDir)
-    const sessions = await provider.discoverSessions()
-
-    expect(sessions).toHaveLength(1)
-    expect(sessions[0]!.provider).toBe('omp')
-    expect(sessions[0]!.project).toBe('myproject')
-  })
-  it('discovers a session when a title entry precedes the session header', async () => {
-    // Real OMP writes title on line 0 and the session header further down.
-    // Discovery must scan past the title instead of requiring session on line 0.
-    const projectDir = join(tmpDir, '--Users-test-myproject--')
-    await writeSession(projectDir, '2026-06-28T_title-first.jsonl', [
-      titleEntry(),
-      sessionMeta({ id: 'sess-title', cwd: '/Users/test/myproject' }),
-      assistantMessage({}),
-    ])
-
-    const provider = createOmpProvider(tmpDir)
-    const sessions = await provider.discoverSessions()
-
-    expect(sessions).toHaveLength(1)
-    expect(sessions[0]!.provider).toBe('omp')
-    expect(sessions[0]!.project).toBe('myproject')
+    const provider = createOmpProvider(dbPath)
+    const sources = await provider.discoverSessions()
+    expect(sources).toHaveLength(1)
+    expect(sources[0]!.provider).toBe('omp')
+    expect(sources[0]!.path).toBe(dbPath)
   })
 
-  it('returns empty for non-existent directory', async () => {
-    const provider = createOmpProvider('/nonexistent/omp/path')
-    const sessions = await provider.discoverSessions()
-    expect(sessions).toEqual([])
+  it('returns empty when the db has no message rows', async () => {
+    const dbPath = createStatsDb()
+    const provider = createOmpProvider(dbPath)
+    expect(await provider.discoverSessions()).toEqual([])
   })
 
-  it('skips files with no session entry', async () => {
-    const projectDir = join(tmpDir, '--Users-test-myproject--')
-    await writeSession(projectDir, 'bad.jsonl', [
-      JSON.stringify({ type: 'message', id: 'x' }),
-    ])
-
-    const provider = createOmpProvider(tmpDir)
-    const sessions = await provider.discoverSessions()
-    expect(sessions).toEqual([])
+  it('returns empty for a non-existent db path', async () => {
+    const provider = createOmpProvider(join(tmpRoot, 'missing.db'))
+    expect(await provider.discoverSessions()).toEqual([])
   })
 
-  it('discovers sessions from named OMP profiles alongside the default dir', async () => {
-    // Real multi-profile OMP keeps the default under <home>/agent/sessions and
-    // each profile under <home>/profiles/<name>/agent/sessions. Production
-    // createOmpProvider() with no override scans both; inject HOME so the
-    // provider resolves those paths under the temp fixture.
-    const ompHome = join(tmpDir, '.omp')
-    const defaultProject = join(ompHome, 'agent', 'sessions', '--Users-test-default--')
-    const profileProject = join(ompHome, 'profiles', 'grok-build', 'agent', 'sessions', '--Users-test-profile--')
-    await writeSession(defaultProject, 'default.jsonl', [
-      sessionMeta({ id: 'sess-default', cwd: '/Users/test/default-proj' }),
-      assistantMessage({ id: 'a1' }),
-    ])
-    await writeSession(profileProject, 'profile.jsonl', [
-      titleEntry(),
-      sessionMeta({ id: 'sess-profile', cwd: '/Users/test/profile-proj' }),
-      assistantMessage({ id: 'a2' }),
-    ])
-
-    const prevHome = process.env.HOME
-    process.env.HOME = tmpDir
-    try {
-      const provider = createOmpProvider()
-      const sessions = await provider.discoverSessions()
-      const projects = sessions.map(s => s.project).sort()
-      expect(projects).toEqual(['default-proj', 'profile-proj'])
-      expect(sessions.every(s => s.provider === 'omp')).toBe(true)
-    } finally {
-      if (prevHome === undefined) delete process.env.HOME
-      else process.env.HOME = prevHome
-    }
+  it('probeRoots reports the db path', async () => {
+    const dbPath = createStatsDb()
+    const provider = createOmpProvider(dbPath)
+    const roots = await provider.probeRoots!()
+    expect(roots).toEqual([{ path: dbPath, label: 'stats.db' }])
   })
 })
 
-describe('omp provider - JSONL parsing', () => {
-  it('extracts token usage from an omp-format assistant message', async () => {
-    const projectDir = join(tmpDir, '--Users-test-myproject--')
-    const filePath = await writeSession(projectDir, 'session.jsonl', [
-      sessionMeta({ id: 'sess-omp-1', cwd: '/Users/test/myproject' }),
-      userMessage('write a test'),
-      assistantMessage({
-        responseId: 'resp-omp-1',
-        timestamp: '2026-04-14T10:00:30.000Z',
-        model: 'claude-sonnet-4-5',
-        input: 1500,
-        output: 300,
-        cacheRead: 2000,
-        cacheWrite: 50,
-      }),
-    ])
+describe.skipIf(!isSqliteAvailable())('omp provider (stats.db) - parsing', () => {
+  it('extracts tokens and preserves OMP cost_total verbatim (no LiteLLM recompute)', async () => {
+    const dbPath = createStatsDb()
+    // cost_total 0.42 is deliberately NOT what LiteLLM would price
+    // gpt-5.6-sol (1000 in / 200 out) at - proving the provider's cost wins.
+    withDb(dbPath, db => insertMessage(db, {
+      entry_id: 'm1', model: 'gpt-5.6-sol',
+      input_tokens: 1000, output_tokens: 200,
+      cache_read_tokens: 5000, cache_write_tokens: 50,
+      cost_total: 0.42,
+    }))
 
-    const provider = createOmpProvider(tmpDir)
-    const source = { path: filePath, project: 'myproject', provider: 'omp' }
+    const provider = createOmpProvider(dbPath)
+    const [source] = await provider.discoverSessions()
     const calls: ParsedProviderCall[] = []
-    for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
-    }
+    for await (const c of provider.createSessionParser(source!, new Set()).parse()) calls.push(c)
 
     expect(calls).toHaveLength(1)
-    const call = calls[0]!
-    expect(call.provider).toBe('omp')
-    expect(call.model).toBe('claude-sonnet-4-5')
-    expect(call.inputTokens).toBe(1500)
-    expect(call.outputTokens).toBe(300)
-    expect(call.cacheReadInputTokens).toBe(2000)
-    expect(call.cachedInputTokens).toBe(2000)
-    expect(call.cacheCreationInputTokens).toBe(50)
-    expect(call.sessionId).toBe('sess-omp-1')
-    expect(call.userMessage).toBe('write a test')
-    expect(call.timestamp).toBe('2026-04-14T10:00:30.000Z')
-    expect(call.deduplicationKey).toContain('omp:')
-    expect(call.deduplicationKey).toContain('resp-omp-1')
+    const c = calls[0]!
+    expect(c.provider).toBe('omp')
+    expect(c.model).toBe('gpt-5.6-sol')
+    expect(c.inputTokens).toBe(1000)
+    expect(c.outputTokens).toBe(200)
+    expect(c.cacheReadInputTokens).toBe(5000)
+    expect(c.cachedInputTokens).toBe(5000)
+    expect(c.cacheCreationInputTokens).toBe(50)
+    expect(c.costUSD).toBe(0.42) // OMP's own cost, not recalculated
   })
 
-  it('ignores the embedded usage.cost and recalculates cost', async () => {
-    const projectDir = join(tmpDir, '--Users-test-myproject--')
-    const filePath = await writeSession(projectDir, 'session.jsonl', [
-      sessionMeta(),
-      assistantMessage({ input: 1000, output: 200, cacheRead: 0, cacheWrite: 0 }),
-    ])
+  it('derives project from the folder column', async () => {
+    const dbPath = createStatsDb()
+    withDb(dbPath, db => insertMessage(db, {
+      entry_id: 'm1', folder: '-Code-Projects-ForzaBlender',
+    }))
 
-    const provider = createOmpProvider(tmpDir)
-    const source = { path: filePath, project: 'myproject', provider: 'omp' }
+    const provider = createOmpProvider(dbPath)
+    const [source] = await provider.discoverSessions()
     const calls: ParsedProviderCall[] = []
-    for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
-    }
+    for await (const cc of provider.createSessionParser(source!, new Set()).parse()) calls.push(cc)
 
-    // cost must be calculated by codeburn, not taken from usage.cost (which is zeroed in fixture)
-    expect(calls[0]!.costUSD).toBeGreaterThanOrEqual(0)
+    expect(calls[0]!.project).toBe('ForzaBlender')
+    expect(calls[0]!.projectPath).toBe('/Code/Projects/ForzaBlender')
   })
 
-  it('collects tool names from toolCall content items', async () => {
-    const projectDir = join(tmpDir, '--Users-test-myproject--')
-    const filePath = await writeSession(projectDir, 'session.jsonl', [
-      sessionMeta(),
-      assistantMessage({
-        tools: [{ name: 'read' }, { name: 'edit' }, { name: 'bash', command: 'bun test' }],
-      }),
-    ])
+  it('joins tool_calls to attach tool names (mapped to display names)', async () => {
+    const dbPath = createStatsDb()
+    withDb(dbPath, db => {
+      insertMessage(db, { entry_id: 'm1' })
+      insertToolCall(db, { entry_id: 'm1', tool_name: 'read' })
+      insertToolCall(db, { entry_id: 'm1', tool_name: 'bash' })
+      insertToolCall(db, { entry_id: 'm1', tool_name: 'grep' })
+    })
 
-    const provider = createOmpProvider(tmpDir)
-    const source = { path: filePath, project: 'myproject', provider: 'omp' }
+    const provider = createOmpProvider(dbPath)
+    const [source] = await provider.discoverSessions()
     const calls: ParsedProviderCall[] = []
-    for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
-    }
+    for await (const c of provider.createSessionParser(source!, new Set()).parse()) calls.push(c)
 
-    expect(calls[0]!.tools).toEqual(['Read', 'Edit', 'Bash'])
-    expect(calls[0]!.bashCommands).toEqual(['bun'])
+    expect(calls[0]!.tools).toEqual(['Read', 'Bash', 'Grep'])
   })
 
-  it('skips assistant messages with zero tokens', async () => {
-    const projectDir = join(tmpDir, '--Users-test-myproject--')
-    const filePath = await writeSession(projectDir, 'session.jsonl', [
-      sessionMeta(),
-      assistantMessage({ input: 0, output: 0 }),
-    ])
+  it('skips rows whose token fields are all zero', async () => {
+    const dbPath = createStatsDb()
+    withDb(dbPath, db => {
+      insertMessage(db, { entry_id: 'm1', input_tokens: 100, output_tokens: 10, cost_total: 0.01 })
+      insertMessage(db, { entry_id: 'm2', input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cost_total: 0 })
+      insertMessage(db, { entry_id: 'm3', input_tokens: 0, output_tokens: 5 }) // cache-less but has output
+    })
 
-    const provider = createOmpProvider(tmpDir)
-    const source = { path: filePath, project: 'myproject', provider: 'omp' }
+    const provider = createOmpProvider(dbPath)
+    const [source] = await provider.discoverSessions()
     const calls: ParsedProviderCall[] = []
-    for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
-    }
+    for await (const c of provider.createSessionParser(source!, new Set()).parse()) calls.push(c)
 
-    expect(calls).toHaveLength(0)
+    expect(calls.map(c => c.deduplicationKey)).toEqual([
+      expect.stringContaining(':m1'),
+      expect.stringContaining(':m3'),
+    ])
+  })
+
+  it('deduplicates by (session_file, entry_id) which the schema guarantees unique', async () => {
+    const dbPath = createStatsDb()
+    withDb(dbPath, db => {
+      insertMessage(db, { entry_id: 'm1', input_tokens: 100, output_tokens: 10 })
+    })
+
+    const provider = createOmpProvider(dbPath)
+    const [source] = await provider.discoverSessions()
+    // Even with a shared seenKeys set, the UNIQUE constraint means each row
+    // appears once in the table, so the parser yields it once.
+    const calls: ParsedProviderCall[] = []
+    for await (const c of provider.createSessionParser(source!, new Set()).parse()) calls.push(c)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.deduplicationKey).toBe(`omp:/tmp/sess/main.jsonl:m1`)
+  })
+
+  it('converts epoch-ms timestamp to ISO', async () => {
+    const dbPath = createStatsDb()
+    withDb(dbPath, db => insertMessage(db, { entry_id: 'm1', timestamp: 1785005105018 }))
+
+    const provider = createOmpProvider(dbPath)
+    const [source] = await provider.discoverSessions()
+    const calls: ParsedProviderCall[] = []
+    for await (const c of provider.createSessionParser(source!, new Set()).parse()) calls.push(c)
+    expect(calls[0]!.timestamp).toBe(new Date(1785005105018).toISOString())
   })
 })

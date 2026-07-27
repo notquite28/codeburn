@@ -25,18 +25,21 @@ SQLite. Tables used:
 
 - `messages` — one row per call: `model`, `folder`, `timestamp` (epoch ms),
   `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`,
-  `cost_total`. `UNIQUE(session_file, entry_id)`.
+  `cost_total`, plus the per-field `cost_input`/`cost_output`/`cost_cache_read`/`cost_cache_write`. `UNIQUE(session_file, entry_id)`.
 - `tool_calls` — tool invocations, joined to `messages` on
   `(session_file, entry_id)` for the tools/activity breakdown.
 
 ## Pricing
 
-OMP's `cost_total` is preserved verbatim (see the provider-cost allowlist in
-`src/parser.ts`). codeburn does **not** recompute via LiteLLM — OMP's real rates
-differ from LiteLLM/fallback for several models (e.g. `gpt-5.6-sol` is ~3.3x
-cheaper than the fallback), and the DB already carries the exact figure. Rows
-with `cost_total = 0` are reported as $0 (OMP priced them $0 — typically cached
-or bundled subagent turns); their tokens still count.
+OMP's `cost_total` is preserved verbatim where OMP priced a call. For the many
+calls OMP logs as $0 — typically subscription/included routing (e.g.
+`openai-codex`) — the provider values them at the **model's own rate derived
+from its priced rows** (e.g. `gpt-5.6-sol` → $5/$30/$0.50 per M), so the
+reported total is gross pay-as-you-go API cost rather than the $0 marginal cost
+OMP recorded. Models OMP never priced fall back to codeburn's LiteLLM/fallback
+rates. This makes a subscription's value visible: compare the reported total
+against the flat subscription fee. The computed cost is kept through the
+pipeline by the `omp` entry in `src/parser.ts`'s provider-cost allowlist.
 
 ## Caching
 

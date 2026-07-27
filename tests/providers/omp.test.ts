@@ -101,12 +101,16 @@ function insertMessage(db: TestDb, o: {
   cache_read_tokens?: number
   cache_write_tokens?: number
   cost_total?: number
+  cost_input?: number
+  cost_output?: number
+  cost_cache_read?: number
+  cost_cache_write?: number
 }): void {
   const ins = db.prepare(`INSERT INTO messages
     (session_file, entry_id, folder, model, timestamp,
      input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-     total_tokens, cost_total)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+     total_tokens, cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
   ins.run(
     o.session_file ?? '/tmp/sess/main.jsonl',
     o.entry_id,
@@ -118,6 +122,10 @@ function insertMessage(db: TestDb, o: {
     o.cache_read_tokens ?? 0,
     o.cache_write_tokens ?? 0,
     (o.input_tokens ?? 1000) + (o.output_tokens ?? 200),
+    o.cost_input ?? 0,
+    o.cost_output ?? 0,
+    o.cost_cache_read ?? 0,
+    o.cost_cache_write ?? 0,
     o.cost_total ?? 0,
   )
 }
@@ -195,6 +203,27 @@ describe.skipIf(!isSqliteAvailable())('omp provider (stats.db) - parsing', () =>
     expect(c.cachedInputTokens).toBe(5000)
     expect(c.cacheCreationInputTokens).toBe(50)
     expect(c.costUSD).toBe(0.42) // OMP's own cost, not recalculated
+  })
+  it('values $0 (subscription) calls at the model rate derived from priced calls', async () => {
+    const dbPath = createStatsDb()
+    withDb(dbPath, db => {
+      // Two priced calls reveal gpt-5.6-sol's real rate: $5/M in, $30/M out.
+      // (1M in * $5 = $5 cost_input; 100K out * $30 = $3 cost_output.)
+      insertMessage(db, { entry_id: 'p1', model: 'gpt-5.6-sol', input_tokens: 1_000_000, output_tokens: 100_000, cost_input: 5, cost_output: 3, cost_total: 8 })
+      insertMessage(db, { entry_id: 'p2', model: 'gpt-5.6-sol', input_tokens: 1_000_000, output_tokens: 100_000, cost_input: 5, cost_output: 3, cost_total: 8 })
+      // A $0 (subscription-routed) call: 2M in + 200K out should be valued at
+      // the derived rate -> 2M*$5/M + 200K*$30/M = $10 + $6 = $16.
+      insertMessage(db, { entry_id: 'z1', model: 'gpt-5.6-sol', input_tokens: 2_000_000, output_tokens: 200_000, cost_total: 0 })
+    })
+
+    const provider = createOmpProvider(dbPath)
+    const [source] = await provider.discoverSessions()
+    const calls: ParsedProviderCall[] = []
+    for await (const c of provider.createSessionParser(source!, new Set()).parse()) calls.push(c)
+
+    const find = (id: string) => calls.find(c => c.deduplicationKey.endsWith(':' + id))!
+    expect(find('p1').costUSD).toBe(8)            // priced -> cost_total verbatim
+    expect(find('z1').costUSD).toBeCloseTo(16, 6) // $0 -> derived rate applied
   })
 
   it('derives project from the folder column', async () => {
